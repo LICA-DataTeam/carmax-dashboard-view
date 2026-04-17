@@ -1,0 +1,6 @@
+.streamlit/
+__pycache/
+tmp/
+env/
+
+.env
