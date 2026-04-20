@@ -1,5 +1,5 @@
 .streamlit/
-__pycache/
+__pycache__/
 tmp/
 env/
 

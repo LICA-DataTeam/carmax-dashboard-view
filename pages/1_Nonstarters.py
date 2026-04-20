@@ -1,12 +1,21 @@
 ﻿from datetime import date
+import os
 
 import pandas as pd
 import streamlit as st
 
 from integrations.bigquery import query_to_dataframe
 
-NONSTARTERS_TABLE_ID = "carmax-ph.liveagent_staging.nonstarters"
-TICKETS_TABLE_ID = "carmax-ph.liveagent.tickets"
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+NONSTARTERS_TABLE_ID = _required_env("NONSTARTERS_TABLE_ID")
+TICKETS_TABLE_ID = _required_env("TICKETS_TABLE_ID")
 DISPLAY_COLUMNS = [
     "ticket_id",
     "nonstarter_reason",
@@ -238,3 +247,4 @@ _render_kpi_cards(total_tickets=monthly_total_tickets, nonstarters_count=nonstar
 
 available_columns = [col for col in DISPLAY_COLUMNS if col in filtered_df.columns]
 st.dataframe(filtered_df[available_columns], use_container_width=True)
+

@@ -1,12 +1,21 @@
 ﻿from datetime import date
+import os
 
 import pandas as pd
 import streamlit as st
 
 from integrations.bigquery import query_to_dataframe
 
-BUDGET_TABLE_ID = "carmax-ph.liveagent_staging.budget_technique_test"
-TICKETS_TABLE_ID = "carmax-ph.liveagent.tickets"
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+BUDGET_TABLE_ID = _required_env("BUDGET_TABLE_ID")
+TICKETS_TABLE_ID = _required_env("TICKETS_TABLE_ID")
 DISPLAY_COLUMNS = [
     "ticket_id",
     "budget_technique_used",
@@ -263,3 +272,4 @@ if "event_at" in show_df.columns:
 
 available_columns = [col for col in DISPLAY_COLUMNS if col in show_df.columns]
 st.dataframe(show_df[available_columns], use_container_width=True)
+
