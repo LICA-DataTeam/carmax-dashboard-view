@@ -18,25 +18,13 @@ NONSTARTERS_TABLE_ID = _required_env("NONSTARTERS_TABLE_ID")
 TICKETS_TABLE_ID = _required_env("TICKETS_TABLE_ID")
 DISPLAY_COLUMNS = [
     "ticket_id",
+    "ticket_status",
+    "ticket_date_created",
     "nonstarter_reason",
     "first_client_message_at",
     "first_agent_reply_at",
     "last_client_message_at",
 ]
-
-
-@st.cache_data(ttl=300)
-def _load_nonstarters_data() -> pd.DataFrame:
-    query = f"""
-        SELECT
-            ticket_id,
-            nonstarter_reason,
-            first_client_message_at,
-            first_agent_reply_at,
-            last_client_message_at
-        FROM `{NONSTARTERS_TABLE_ID}`
-    """
-    return query_to_dataframe(query)
 
 
 @st.cache_data(ttl=900)
@@ -55,13 +43,14 @@ def _load_ticket_date_bounds() -> tuple[date | None, date | None]:
 
 
 @st.cache_data(ttl=900)
-def _load_monthly_total_tickets(month_start: date) -> int:
-    month_start_iso = month_start.isoformat()
+def _load_total_tickets_in_range(start_date: date, end_date: date) -> int:
+    start_iso = start_date.isoformat()
+    end_iso = end_date.isoformat()
     query = f"""
         SELECT COUNT(DISTINCT CAST(id AS STRING)) AS total_tickets
         FROM `{TICKETS_TABLE_ID}`
-        WHERE DATE(date_created) >= DATE('{month_start_iso}')
-          AND DATE(date_created) < DATE_ADD(DATE('{month_start_iso}'), INTERVAL 1 MONTH)
+        WHERE DATE(date_created) >= DATE('{start_iso}')
+          AND DATE(date_created) <= DATE('{end_iso}')
     """
     df = query_to_dataframe(query)
     if df.empty:
@@ -69,10 +58,38 @@ def _load_monthly_total_tickets(month_start: date) -> int:
     return int(df.loc[0, "total_tickets"] or 0)
 
 
+@st.cache_data(ttl=300)
+def _load_nonstarters_in_range(start_date: date, end_date: date) -> pd.DataFrame:
+    start_iso = start_date.isoformat()
+    end_iso = end_date.isoformat()
+    query = f"""
+        SELECT
+            CAST(t.id AS STRING) AS ticket_id,
+            t.status AS ticket_status,
+            t.date_created AS ticket_date_created,
+            n.nonstarter_reason,
+            n.first_client_message_at,
+            n.first_agent_reply_at,
+            n.last_client_message_at
+        FROM `{TICKETS_TABLE_ID}` t
+        INNER JOIN `{NONSTARTERS_TABLE_ID}` n
+            ON CAST(t.id AS STRING) = CAST(n.ticket_id AS STRING)
+        WHERE DATE(t.date_created) >= DATE('{start_iso}')
+          AND DATE(t.date_created) <= DATE('{end_iso}')
+    """
+    return query_to_dataframe(query)
+
+
 def _prepare_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
     prepared = df.copy()
-    for col in ["first_client_message_at", "first_agent_reply_at", "last_client_message_at"]:
-        prepared[col] = pd.to_datetime(prepared[col], errors="coerce")
+    for col in [
+        "ticket_date_created",
+        "first_client_message_at",
+        "first_agent_reply_at",
+        "last_client_message_at",
+    ]:
+        if col in prepared.columns:
+            prepared[col] = pd.to_datetime(prepared[col], errors="coerce")
     return prepared
 
 
@@ -96,7 +113,7 @@ def _get_nonstarter_theme(nonstarter_rate_pct: float) -> dict:
     }
 
 
-def _render_kpi_cards(total_tickets: int, nonstarters_count: int, month_label: str) -> None:
+def _render_kpi_cards(total_tickets: int, nonstarters_count: int, period_label: str) -> None:
     nonstarter_rate = (nonstarters_count / total_tickets * 100) if total_tickets else 0.0
     theme = _get_nonstarter_theme(nonstarter_rate)
 
@@ -146,9 +163,9 @@ def _render_kpi_cards(total_tickets: int, nonstarters_count: int, month_label: s
     c1.markdown(
         f"""
         <div class="kpi-card" style="background: linear-gradient(135deg, #dbeafe, #bfdbfe); border: 1px solid #60a5fa;">
-            <div class="kpi-title">Total number of tickets</div>
+            <div class="kpi-title">Total tickets created</div>
             <div class="kpi-value">{total_tickets:,}</div>
-            <div class="kpi-sub">Month: {month_label}</div>
+            <div class="kpi-sub">Range: {period_label}</div>
             <div class="kpi-sub">Nonstarter rate: {nonstarter_rate:.1f}%</div>
         </div>
         """,
@@ -160,7 +177,7 @@ def _render_kpi_cards(total_tickets: int, nonstarters_count: int, month_label: s
         <div class="kpi-card" style="background: {theme['bg']}; border: 1px solid {theme['border']};">
             <div class="kpi-title">Number of nonstarters</div>
             <div class="kpi-value">{nonstarters_count:,}</div>
-            <div class="kpi-sub">{nonstarter_rate:.1f}% of monthly tickets</div>
+            <div class="kpi-sub">{nonstarter_rate:.1f}% of selected tickets</div>
             <div class="kpi-tag">{theme['label']}</div>
         </div>
         """,
@@ -171,39 +188,14 @@ def _render_kpi_cards(total_tickets: int, nonstarters_count: int, month_label: s
 st.write("# Nonstarters")
 
 try:
-    df = _prepare_datetime_columns(_load_nonstarters_data())
-except Exception as exc:
-    st.error(f"Failed to load nonstarters data: {exc}")
-    st.stop()
-
-if df.empty:
-    st.info("No data found.")
-    st.stop()
-
-monthly_total_tickets = 0
-monthly_label = "N/A"
-
-# Date picker bounds are based on liveagent.tickets so users can navigate months
-# even when nonstarters has sparse rows.
-try:
     picker_min, picker_max = _load_ticket_date_bounds()
 except Exception as exc:
-    st.warning(f"Could not load ticket date bounds; falling back to nonstarters dates. ({exc})")
-    picker_min, picker_max = None, None
+    st.error(f"Failed to load ticket date bounds: {exc}")
+    st.stop()
 
 if picker_min is None or picker_max is None:
-    if df["first_client_message_at"].notna().any():
-        picker_min = df["first_client_message_at"].min().date()
-        picker_max = df["first_client_message_at"].max().date()
-    else:
-        st.warning("No valid dates available for filtering.")
-        filtered_df = df.copy()
-        nonstarters_mask = filtered_df["nonstarter_reason"].fillna("").astype(str).str.strip().ne("")
-        nonstarters_count = int(filtered_df.loc[nonstarters_mask, "ticket_id"].nunique(dropna=True))
-        _render_kpi_cards(total_tickets=0, nonstarters_count=nonstarters_count, month_label=monthly_label)
-        available_columns = [col for col in DISPLAY_COLUMNS if col in filtered_df.columns]
-        st.dataframe(filtered_df[available_columns], use_container_width=True)
-        st.stop()
+    st.warning("No valid ticket creation dates available for filtering.")
+    st.stop()
 
 default_start = picker_max.replace(day=1)
 if default_start < picker_min:
@@ -221,30 +213,23 @@ if start_date > end_date:
     st.error("Start date cannot be after end date.")
     st.stop()
 
-if df["first_client_message_at"].notna().any():
-    date_mask = (
-        df["first_client_message_at"].dt.date.ge(start_date)
-        & df["first_client_message_at"].dt.date.le(end_date)
-    )
-    filtered_df = df[date_mask].copy()
-else:
-    filtered_df = df.iloc[0:0].copy()
+try:
+    filtered_df = _prepare_datetime_columns(_load_nonstarters_in_range(start_date, end_date))
+    total_tickets = _load_total_tickets_in_range(start_date, end_date)
+except Exception as exc:
+    st.error(f"Failed to load nonstarters for selected range: {exc}")
+    st.stop()
 
-selected_month = pd.Period(start_date, freq="M")
-month_start = selected_month.start_time.date()
-monthly_total_tickets = _load_monthly_total_tickets(month_start)
-monthly_label = selected_month.strftime("%B %Y")
+period_label = f"{start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}"
+nonstarters_count = int(filtered_df["ticket_id"].nunique(dropna=True)) if "ticket_id" in filtered_df.columns else 0
 
-if pd.Period(end_date, freq="M") != selected_month:
-    st.warning("Total number of tickets uses the month of the selected start date.")
+if "ticket_date_created" in filtered_df.columns:
+    filtered_df = filtered_df.sort_values(by="ticket_date_created", ascending=False)
 
-filtered_df = filtered_df.sort_values(by="first_client_message_at", ascending=False)
+_render_kpi_cards(total_tickets=total_tickets, nonstarters_count=nonstarters_count, period_label=period_label)
 
-nonstarters_mask = filtered_df["nonstarter_reason"].fillna("").astype(str).str.strip().ne("")
-nonstarters_count = int(filtered_df.loc[nonstarters_mask, "ticket_id"].nunique(dropna=True))
-
-_render_kpi_cards(total_tickets=monthly_total_tickets, nonstarters_count=nonstarters_count, month_label=monthly_label)
+if filtered_df.empty:
+    st.info("No nonstarters found for the selected ticket-created date range.")
 
 available_columns = [col for col in DISPLAY_COLUMNS if col in filtered_df.columns]
 st.dataframe(filtered_df[available_columns], use_container_width=True)
-

@@ -18,6 +18,8 @@ BUDGET_TABLE_ID = _required_env("BUDGET_TABLE_ID")
 TICKETS_TABLE_ID = _required_env("TICKETS_TABLE_ID")
 DISPLAY_COLUMNS = [
     "ticket_id",
+    "ticket_status",
+    "ticket_date_created",
     "budget_technique_used",
     "continued_after_budget",
     "budget_nonstarter",
@@ -25,22 +27,6 @@ DISPLAY_COLUMNS = [
     "window_start",
     "nonstarter_reason",
 ]
-
-
-@st.cache_data(ttl=300)
-def _load_budget_data() -> pd.DataFrame:
-    query = f"""
-        SELECT
-            ticket_id,
-            budget_technique_used,
-            continued_after_budget,
-            budget_nonstarter,
-            first_budget_ask_at,
-            window_start,
-            nonstarter_reason
-        FROM `{BUDGET_TABLE_ID}`
-    """
-    return query_to_dataframe(query)
 
 
 @st.cache_data(ttl=900)
@@ -59,13 +45,14 @@ def _load_ticket_date_bounds() -> tuple[date | None, date | None]:
 
 
 @st.cache_data(ttl=900)
-def _load_monthly_total_tickets(month_start: date) -> int:
-    month_start_iso = month_start.isoformat()
+def _load_total_tickets_in_range(start_date: date, end_date: date) -> int:
+    start_iso = start_date.isoformat()
+    end_iso = end_date.isoformat()
     query = f"""
         SELECT COUNT(DISTINCT CAST(id AS STRING)) AS total_tickets
         FROM `{TICKETS_TABLE_ID}`
-        WHERE DATE(date_created) >= DATE('{month_start_iso}')
-          AND DATE(date_created) < DATE_ADD(DATE('{month_start_iso}'), INTERVAL 1 MONTH)
+        WHERE DATE(date_created) >= DATE('{start_iso}')
+          AND DATE(date_created) <= DATE('{end_iso}')
     """
     df = query_to_dataframe(query)
     if df.empty:
@@ -73,12 +60,35 @@ def _load_monthly_total_tickets(month_start: date) -> int:
     return int(df.loc[0, "total_tickets"] or 0)
 
 
+@st.cache_data(ttl=300)
+def _load_budget_in_range(start_date: date, end_date: date) -> pd.DataFrame:
+    start_iso = start_date.isoformat()
+    end_iso = end_date.isoformat()
+    query = f"""
+        SELECT
+            CAST(t.id AS STRING) AS ticket_id,
+            t.status AS ticket_status,
+            t.date_created AS ticket_date_created,
+            b.budget_technique_used,
+            b.continued_after_budget,
+            b.budget_nonstarter,
+            b.first_budget_ask_at,
+            b.window_start,
+            b.nonstarter_reason
+        FROM `{TICKETS_TABLE_ID}` t
+        INNER JOIN `{BUDGET_TABLE_ID}` b
+            ON CAST(t.id AS STRING) = CAST(b.ticket_id AS STRING)
+        WHERE DATE(t.date_created) >= DATE('{start_iso}')
+          AND DATE(t.date_created) <= DATE('{end_iso}')
+    """
+    return query_to_dataframe(query)
+
+
 def _prepare_budget_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     prepared = df.copy()
-    prepared["first_budget_ask_at"] = pd.to_datetime(prepared["first_budget_ask_at"], errors="coerce")
-    prepared["window_start"] = pd.to_datetime(prepared["window_start"], errors="coerce")
-    prepared["event_at"] = prepared["first_budget_ask_at"].combine_first(prepared["window_start"])
-    prepared["event_date"] = prepared["event_at"].dt.date
+    for col in ["ticket_date_created", "first_budget_ask_at", "window_start"]:
+        if col in prepared.columns:
+            prepared[col] = pd.to_datetime(prepared[col], errors="coerce")
     return prepared
 
 
@@ -148,28 +158,14 @@ def _render_metric_cards(cards: list[dict]) -> None:
 st.write("# Budget Technique")
 
 try:
-    budget_df = _prepare_budget_dataframe(_load_budget_data())
-except Exception as exc:
-    st.error(f"Failed to load budget-technique data: {exc}")
-    st.stop()
-
-if budget_df.empty:
-    st.info("No budget-technique data found.")
-    st.stop()
-
-try:
     picker_min, picker_max = _load_ticket_date_bounds()
 except Exception as exc:
-    st.warning(f"Could not load ticket date bounds; falling back to budget-technique dates. ({exc})")
-    picker_min, picker_max = None, None
+    st.error(f"Failed to load ticket date bounds: {exc}")
+    st.stop()
 
 if picker_min is None or picker_max is None:
-    valid_event_dates = budget_df["event_date"].dropna()
-    if valid_event_dates.empty:
-        st.warning("No valid dates available for filtering.")
-        st.stop()
-    picker_min = valid_event_dates.min()
-    picker_max = valid_event_dates.max()
+    st.warning("No valid ticket creation dates available for filtering.")
+    st.stop()
 
 default_start = picker_max.replace(day=1)
 if default_start < picker_min:
@@ -187,17 +183,12 @@ if start_date > end_date:
     st.error("Start date cannot be after end date.")
     st.stop()
 
-filtered_df = budget_df[
-    budget_df["event_date"].ge(start_date) & budget_df["event_date"].le(end_date)
-].copy()
-
-selected_month = pd.Period(start_date, freq="M")
-month_start = selected_month.start_time.date()
-month_label = selected_month.strftime("%B %Y")
-monthly_total_tickets = _load_monthly_total_tickets(month_start)
-
-if pd.Period(end_date, freq="M") != selected_month:
-    st.warning("Monthly metrics use the month of the selected start date.")
+try:
+    filtered_df = _prepare_budget_dataframe(_load_budget_in_range(start_date, end_date))
+    total_tickets = _load_total_tickets_in_range(start_date, end_date)
+except Exception as exc:
+    st.error(f"Failed to load budget-technique data for selected range: {exc}")
+    st.stop()
 
 budget_used_mask = filtered_df["budget_technique_used"].fillna(False).astype(bool)
 continued_mask = filtered_df["continued_after_budget"].fillna(False).astype(bool)
@@ -209,39 +200,40 @@ budget_nonstarter_tickets = int(
     filtered_df.loc[budget_used_mask & nonstarter_budget_mask, "ticket_id"].nunique(dropna=True)
 )
 
-budget_usage_rate = (budget_tickets / monthly_total_tickets * 100) if monthly_total_tickets else 0.0
+budget_usage_rate = (budget_tickets / total_tickets * 100) if total_tickets else 0.0
 budget_continuation_rate = (continued_tickets / budget_tickets * 100) if budget_tickets else 0.0
 budget_nonstarter_rate = (budget_nonstarter_tickets / budget_tickets * 100) if budget_tickets else 0.0
-continuation_rate_vs_all = (continued_tickets / monthly_total_tickets * 100) if monthly_total_tickets else 0.0
+continuation_rate_vs_all = (continued_tickets / total_tickets * 100) if total_tickets else 0.0
 
 usage_theme = {"bg": "linear-gradient(135deg, #dbeafe, #bfdbfe)", "border": "#60a5fa"}
 continuation_theme = _rate_theme(budget_continuation_rate, good_high=True)
 nonstarter_theme = _rate_theme(budget_nonstarter_rate, good_high=False)
 continuation_all_theme = _rate_theme(continuation_rate_vs_all, good_high=True)
 
+period_label = f"{start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}"
 cards = [
     {
-        "title": "Total number of tickets (month)",
-        "value": f"{monthly_total_tickets:,}",
-        "sub": f"Month: {month_label}",
+        "title": "Total number of tickets (range)",
+        "value": f"{total_tickets:,}",
+        "sub": f"Range: {period_label}",
         **usage_theme,
     },
     {
         "title": "Tickets with budget technique used",
         "value": f"{budget_tickets:,}",
-        "sub": f"{budget_usage_rate:.1f}% of monthly tickets",
+        "sub": f"{budget_usage_rate:.1f}% of selected tickets",
         **usage_theme,
     },
     {
         "title": "Budget technique usage rate",
         "value": f"{budget_usage_rate:.1f}%",
-        "sub": f"{budget_tickets:,} / {monthly_total_tickets:,} tickets",
+        "sub": f"{budget_tickets:,} / {total_tickets:,} tickets",
         **usage_theme,
     },
     {
         "title": "Budget technique continuation rate",
         "value": f"{budget_continuation_rate:.1f}%",
-        "sub": f"Among budget-technique tickets",
+        "sub": "Among budget-technique tickets",
         **continuation_theme,
     },
     {
@@ -253,13 +245,13 @@ cards = [
     {
         "title": "Continued because of budget technique",
         "value": f"{continued_tickets:,}",
-        "sub": f"Conversations/tickets continued",
+        "sub": "Conversations/tickets continued",
         **continuation_theme,
     },
     {
         "title": "Continuation rate of the budget technique",
         "value": f"{continuation_rate_vs_all:.1f}%",
-        "sub": "Continued tickets vs monthly total",
+        "sub": "Continued tickets vs selected total",
         **continuation_all_theme,
     },
 ]
@@ -267,9 +259,11 @@ cards = [
 _render_metric_cards(cards)
 
 show_df = filtered_df.copy()
-if "event_at" in show_df.columns:
-    show_df = show_df.sort_values(by="event_at", ascending=False)
+if "ticket_date_created" in show_df.columns:
+    show_df = show_df.sort_values(by="ticket_date_created", ascending=False)
+
+if show_df.empty:
+    st.info("No budget-technique records found for the selected ticket-created date range.")
 
 available_columns = [col for col in DISPLAY_COLUMNS if col in show_df.columns]
 st.dataframe(show_df[available_columns], use_container_width=True)
-
