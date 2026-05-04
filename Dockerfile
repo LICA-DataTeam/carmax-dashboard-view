@@ -11,8 +11,6 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
 
-CMD ["sh", "-c", "streamlit run app.py \
-  --server.address=0.0.0.0 \
-  --server.port=$PORT \
-  --server.headless=true \
-  --browser.gatherUsageStats=false"]
+EXPOSE 8080
+
+ENTRYPOINT ["streamlit", "run", "app.py", "--server.port=8080", "--server.address=0.0.0.0"]
