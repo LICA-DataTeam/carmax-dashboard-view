@@ -20,10 +20,9 @@ DISPLAY_COLUMNS = [
     "ticket_id",
     "ticket_status",
     "ticket_date_created",
-    "nonstarter_reason",
     "first_client_message_at",
     "first_agent_reply_at",
-    "last_client_message_at",
+    # "last_client_message_at",
 ]
 
 
@@ -67,10 +66,8 @@ def _load_nonstarters_in_range(start_date: date, end_date: date) -> pd.DataFrame
             CAST(t.id AS STRING) AS ticket_id,
             t.status AS ticket_status,
             t.date_created AS ticket_date_created,
-            n.nonstarter_reason,
             n.first_client_message_at,
-            n.first_agent_reply_at,
-            n.last_client_message_at
+            n.first_agent_reply_at
         FROM `{TICKETS_TABLE_ID}` t
         INNER JOIN `{NONSTARTERS_TABLE_ID}` n
             ON CAST(t.id AS STRING) = CAST(n.ticket_id AS STRING)
@@ -86,7 +83,6 @@ def _prepare_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
         "ticket_date_created",
         "first_client_message_at",
         "first_agent_reply_at",
-        "last_client_message_at",
     ]:
         if col in prepared.columns:
             prepared[col] = pd.to_datetime(prepared[col], errors="coerce")
@@ -113,7 +109,13 @@ def _get_nonstarter_theme(nonstarter_rate_pct: float) -> dict:
     }
 
 
-def _render_kpi_cards(total_tickets: int, nonstarters_count: int, period_label: str) -> None:
+def _render_kpi_cards(
+    total_tickets: int,
+    nonstarters_count: int,
+    period_label: str,
+    raw_nonstarters_rows: int = 0,
+    show_raw_card: bool = False,
+) -> None:
     nonstarter_rate = (nonstarters_count / total_tickets * 100) if total_tickets else 0.0
     theme = _get_nonstarter_theme(nonstarter_rate)
 
@@ -159,7 +161,8 @@ def _render_kpi_cards(total_tickets: int, nonstarters_count: int, period_label: 
         unsafe_allow_html=True,
     )
 
-    c1, c2 = st.columns(2)
+    columns = st.columns(3 if show_raw_card else 2)
+    c1, c2 = columns[0], columns[1]
     c1.markdown(
         f"""
         <div class="kpi-card" style="background: linear-gradient(135deg, #dbeafe, #bfdbfe); border: 1px solid #60a5fa;">
@@ -183,6 +186,20 @@ def _render_kpi_cards(total_tickets: int, nonstarters_count: int, period_label: 
         """,
         unsafe_allow_html=True,
     )
+
+    if show_raw_card:
+        raw_nonstarter_rate = (raw_nonstarters_rows / total_tickets * 100)
+        columns[2].markdown(
+            f"""
+            <div class="kpi-card" style="background: linear-gradient(135deg, #ffe8cc, #ffd8a8); border: 1px solid #f08c00;">
+                <div class="kpi-title">Raw nonstarter rows</div>
+                <div class="kpi-value">{raw_nonstarters_rows:,}</div>
+                <div class="kpi-sub">Includes duplicate ticket IDs across runs</div>
+                <div class="kpi-sub">Nonstarter rate: {raw_nonstarter_rate:.1f}%</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 st.write("# Nonstarters")
@@ -222,11 +239,24 @@ except Exception as exc:
 
 period_label = f"{start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}"
 nonstarters_count = int(filtered_df["ticket_id"].nunique(dropna=True)) if "ticket_id" in filtered_df.columns else 0
+raw_nonstarters_rows = int(len(filtered_df))
 
 if "ticket_date_created" in filtered_df.columns:
     filtered_df = filtered_df.sort_values(by="ticket_date_created", ascending=False)
 
-_render_kpi_cards(total_tickets=total_tickets, nonstarters_count=nonstarters_count, period_label=period_label)
+show_raw_nonstarters_card = st.toggle(
+    "Show raw nonstarter rows card",
+    value=False,
+    help="Includes duplicate ticket IDs that can happen across multiple pipeline runs.",
+)
+
+_render_kpi_cards(
+    total_tickets=total_tickets,
+    nonstarters_count=nonstarters_count,
+    period_label=period_label,
+    raw_nonstarters_rows=raw_nonstarters_rows,
+    show_raw_card=show_raw_nonstarters_card,
+)
 
 if filtered_df.empty:
     st.info("No nonstarters found for the selected ticket-created date range.")
