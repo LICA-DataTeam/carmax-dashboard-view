@@ -1,0 +1,10 @@
+.git
+.gitignore
+.devcontainer
+env
+__pycache__
+tmp
+.streamlit
+
+.env
+google-creds.json
